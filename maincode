@@ -1,0 +1,2146 @@
+# 5G Spectrum Allocation: QUBO -> Ising/QAOA -> IBM Backend
+# ============================================================
+
+# Install once if needed:
+# !pip install -U qiskit qiskit-aer qiskit-ibm-runtime scipy numpy pandas matplotlib networkx
+
+import os
+import json
+import itertools
+import pathlib
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import networkx as nx
+
+from scipy.optimize import minimize
+
+from qiskit import QuantumCircuit
+from qiskit.quantum_info import Statevector
+from qiskit.transpiler import generate_preset_pass_manager
+
+from qiskit_aer import AerSimulator
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
+# ============================================================
+# 1. BASIC SETTINGS
+# ============================================================
+
+OUTDIR = pathlib.Path("qslicenet_qiskit_results")
+OUTDIR.mkdir(exist_ok=True)
+
+SEED = 42
+rng = np.random.default_rng(SEED)
+
+SHOTS = 4096
+
+# IBM backend name
+IBM_BACKEND_NAME = "ibm_fez"
+
+# Set True only when you want to submit real hardware job
+RUN_REAL_IBM_BACKEND = False
+
+# Run noisy simulator based on ibm_fez calibration/noise
+RUN_IBM_NOISE_SIMULATOR = True
+
+# QAOA parameters
+QAOA_DEPTHS = [1, 2]
+MAXITER = 100
+N_STARTS = 3
+
+# ============================================================
+# 2. DEFINE 5G NETWORK PROBLEM
+# ============================================================
+
+# 5 users and 3 resource blocks
+N_USERS = 5
+N_BLOCKS = 3
+N_QUBITS = N_USERS * N_BLOCKS
+
+def var_index(user, block):
+    return user * N_BLOCKS + block
+
+def inv_var_index(a):
+    return a // N_BLOCKS, a % N_BLOCKS
+
+def var_label(a):
+    i, k = inv_var_index(a)
+    return f"U{i+1}R{k+1}"
+
+# Utility matrix u[i,k]
+# Larger utility = better assignment
+utility = np.array([
+    [9.0, 4.0, 7.0],
+    [8.0, 6.0, 5.0],
+    [5.0, 9.0, 6.0],
+    [7.0, 5.0, 8.0],
+    [6.0, 8.0, 4.0],
+])
+
+# Target load for each resource block
+target_load = np.array([2, 2, 1])
+
+# Interference edges: user_i, user_j, weight
+interference_edges = [
+    (0, 1, 1.00),
+    (0, 2, 0.80),
+    (1, 2, 1.20),
+    (1, 3, 0.60),
+    (2, 4, 1.00),
+    (3, 4, 0.70),
+]
+
+# Penalty weights
+ALPHA_UTILITY = 1.0
+A_ASSIGN = 9.0
+B_BALANCE = 1.5
+D_INTERFERENCE = 8.0
+
+# ============================================================
+# 3. BUILD QUBO
+# Cost:
+# C(x) =
+# - utility reward
+# + assignment penalty
+# + load-balance penalty
+# + interference penalty
+# ============================================================
+
+constant = 0.0
+linear = np.zeros(N_QUBITS)
+quadratic = np.zeros((N_QUBITS, N_QUBITS))
+
+def add_linear(a, coeff):
+    linear[a] += coeff
+
+def add_quadratic(a, b, coeff):
+    if a == b:
+        linear[a] += coeff
+    else:
+        i, j = sorted((a, b))
+        quadratic[i, j] += coeff
+
+# Utility term: -sum u[i,k] x[i,k]
+for i in range(N_USERS):
+    for k in range(N_BLOCKS):
+        a = var_index(i, k)
+        add_linear(a, -ALPHA_UTILITY * utility[i, k])
+
+# Assignment penalty: A(1 - sum_k x[i,k])^2
+for i in range(N_USERS):
+    constant += A_ASSIGN
+
+    for k in range(N_BLOCKS):
+        a = var_index(i, k)
+        add_linear(a, -A_ASSIGN)
+
+    for k1 in range(N_BLOCKS):
+        for k2 in range(k1 + 1, N_BLOCKS):
+            a = var_index(i, k1)
+            b = var_index(i, k2)
+            add_quadratic(a, b, 2 * A_ASSIGN)
+
+# Balance penalty: B(sum_i x[i,k] - Ck)^2
+for k in range(N_BLOCKS):
+    Ck = target_load[k]
+    constant += B_BALANCE * Ck**2
+
+    for i in range(N_USERS):
+        a = var_index(i, k)
+        add_linear(a, B_BALANCE * (1 - 2 * Ck))
+
+    for i in range(N_USERS):
+        for j in range(i + 1, N_USERS):
+            a = var_index(i, k)
+            b = var_index(j, k)
+            add_quadratic(a, b, 2 * B_BALANCE)
+# Interference penalty: D w_ij x[i,k]x[j,k]
+for i, j, w in interference_edges:
+    for k in range(N_BLOCKS):
+        a = var_index(i, k)
+        b = var_index(j, k)
+        add_quadratic(a, b, D_INTERFERENCE * w)
+
+def qubo_cost(bits):
+    bits = np.array(bits, dtype=int)
+    cost = constant + np.dot(linear, bits)
+
+    for i in range(N_QUBITS):
+        for j in range(i + 1, N_QUBITS):
+            cost += quadratic[i, j] * bits[i] * bits[j]
+
+    return float(cost)
+
+# QUBO matrix for plotting
+Q_display = np.zeros((N_QUBITS, N_QUBITS))
+np.fill_diagonal(Q_display, linear)
+for i in range(N_QUBITS):
+    for j in range(i + 1, N_QUBITS):
+        Q_display[i, j] = quadratic[i, j]
+        Q_display[j, i] = quadratic[i, j]
+
+# ============================================================
+# 4. DECODING AND METRICS
+# ============================================================
+
+def assignment_to_bits(assign):
+    bits = np.zeros(N_QUBITS, dtype=int)
+    for i, k in enumerate(assign):
+        bits[var_index(i, k)] = 1
+    return bits
+
+def bits_to_assignment(bits):
+    bits = np.array(bits, dtype=int)
+    assign = []
+
+    for i in range(N_USERS):
+        row = bits[i*N_BLOCKS:(i+1)*N_BLOCKS]
+        chosen = np.where(row == 1)[0]
+
+        if len(chosen) != 1:
+            return None
+
+        assign.append(int(chosen[0]))
+
+    return tuple(assign)
+
+def repair_bits(bits):
+    bits = np.array(bits, dtype=int)
+
+    assign = [-1] * N_USERS
+    loads = np.zeros(N_BLOCKS, dtype=int)
+
+    # keep valid one-hot rows
+    for i in range(N_USERS):
+        row = bits[i*N_BLOCKS:(i+1)*N_BLOCKS]
+        chosen = np.where(row == 1)[0]
+
+        if len(chosen) == 1:
+            k = int(chosen[0])
+            assign[i] = k
+            loads[k] += 1
+
+    # repair invalid rows
+    for i in range(N_USERS):
+        if assign[i] != -1:
+            continue
+
+        best_k = None
+        best_score = 1e18
+
+        for k in range(N_BLOCKS):
+            score = -utility[i, k]
+
+            before = (loads[k] - target_load[k])**2
+            after = (loads[k] + 1 - target_load[k])**2
+            score += B_BALANCE * (after - before)
+
+            for a, b, w in interference_edges:
+                if a == i and assign[b] == k:
+                    score += D_INTERFERENCE * w
+                if b == i and assign[a] == k:
+                    score += D_INTERFERENCE * w
+
+            if score < best_score:
+                best_score = score
+                best_k = k
+
+        assign[i] = best_k
+        loads[best_k] += 1
+
+    return tuple(assign)
+
+def assignment_metrics(assign):
+    bits = assignment_to_bits(assign)
+
+    total_utility = sum(utility[i, assign[i]] for i in range(N_USERS))
+
+    conflicts = 0
+    weighted_conflict = 0.0
+
+    for i, j, w in interference_edges:
+        if assign[i] == assign[j]:
+            conflicts += 1
+            weighted_conflict += w
+
+    loads = np.zeros(N_BLOCKS, dtype=int)
+    for k in assign:
+        loads[k] += 1
+
+    return {
+        "assignment": assign,
+        "utility": float(total_utility),
+        "conflicts": conflicts,
+        "weighted_conflict": float(weighted_conflict),
+        "loads": tuple(loads.tolist()),
+        "cost": qubo_cost(bits),
+    }
+def key_to_bits(key):
+    # Qiskit count key is reversed compared to qubit index order
+    return np.array([int(b) for b in key[::-1]], dtype=int)
+
+def bits_to_key(bits):
+    return "".join(str(int(bits[i])) for i in reversed(range(len(bits))))
+
+# ============================================================
+# 5. CLASSICAL BASELINES
+# ============================================================
+
+def brute_force_exact():
+    best = None
+
+    for assign in itertools.product(range(N_BLOCKS), repeat=N_USERS):
+        metrics = assignment_metrics(assign)
+
+        if best is None or metrics["cost"] < best["cost"]:
+            best = metrics
+
+    return best
+
+def greedy_baseline():
+    assign = [-1] * N_USERS
+    loads = np.zeros(N_BLOCKS, dtype=int)
+
+    user_order = np.argsort(-utility.max(axis=1))
+
+    for i in user_order:
+        best_k = None
+        best_score = 1e18
+
+        for k in range(N_BLOCKS):
+            score = -utility[i, k]
+
+            before = (loads[k] - target_load[k])**2
+            after = (loads[k] + 1 - target_load[k])**2
+            score += B_BALANCE * (after - before)
+
+            for a, b, w in interference_edges:
+                if a == i and assign[b] == k:
+                    score += D_INTERFERENCE * w
+                if b == i and assign[a] == k:
+                    score += D_INTERFERENCE * w
+
+            if score < best_score:
+                best_score = score
+                best_k = k
+
+        assign[i] = best_k
+        loads[best_k] += 1
+
+    return assignment_metrics(tuple(assign))
+
+def random_baseline(samples=5000):
+    best = None
+
+    for _ in range(samples):
+        assign = tuple(rng.integers(0, N_BLOCKS, size=N_USERS))
+        metrics = assignment_metrics(assign)
+
+        if best is None or metrics["cost"] < best["cost"]:
+            best = metrics
+
+    return best
+
+brute_best = brute_force_exact()
+greedy_best = greedy_baseline()
+random_best = random_baseline()
+
+print("Random:", random_best)
+print("Greedy:", greedy_best)
+print("Brute force:", brute_best)
+
+
+# ============================================================
+# 6. QUBO TO ISING
+# x = (1 - Z)/2
+# H_C = sum h_i Z_i + sum J_ij Z_i Z_j
+# ============================================================
+
+ising_constant = constant
+z_linear = np.zeros(N_QUBITS)
+zz_couplings = np.zeros((N_QUBITS, N_QUBITS))
+
+# Linear QUBO terms
+for i in range(N_QUBITS):
+    h = linear[i]
+
+    ising_constant += h / 2
+    z_linear[i] += -h / 2
+
+# Quadratic QUBO terms
+for i in range(N_QUBITS):
+    for j in range(i + 1, N_QUBITS):
+        q = quadratic[i, j]
+
+        if abs(q) > 1e-12:
+            ising_constant += q / 4
+            z_linear[i] += -q / 4
+            z_linear[j] += -q / 4
+            zz_couplings[i, j] += q / 4
+
+
+print("Number of qubits:", N_QUBITS)
+print("Ising constant:", ising_constant)
+print("Number of ZZ couplings:", np.count_nonzero(zz_couplings))
+
+
+# ============================================================
+# 7. BUILD QAOA CIRCUIT
+# ============================================================
+
+def build_qaoa_circuit(gammas, betas, measure=False):
+    p = len(gammas)
+    qc = QuantumCircuit(N_QUBITS)
+
+    # Initial state |+>^n
+    qc.h(range(N_QUBITS))
+
+    for layer in range(p):
+        gamma = float(gammas[layer])
+        beta = float(betas[layer])
+
+        # Cost layer: Z rotations
+        for q in range(N_QUBITS):
+            h = z_linear[q]
+            if abs(h) > 1e-12:
+                qc.rz(2 * gamma * h, q)
+
+        # Cost layer: ZZ rotations using CX-RZ-CX
+        for i in range(N_QUBITS):
+            for j in range(i + 1, N_QUBITS):
+                J = zz_couplings[i, j]
+
+                if abs(J) > 1e-12:
+                    qc.cx(i, j)
+                    qc.rz(2 * gamma * J, j)
+                    qc.cx(i, j)
+
+        # Mixer layer: RX gates
+        for q in range(N_QUBITS):
+            qc.rx(2 * beta, q)
+
+    if measure:
+        qc.measure_all()
+
+    return qc
+
+
+    # ============================================================
+# 8. QAOA OPTIMIZATION USING STATEVECTOR
+# ============================================================
+
+def index_to_bits(index, n=N_QUBITS):
+    return np.array([(index >> q) & 1 for q in range(n)], dtype=int)
+
+# Precompute all QUBO costs
+all_costs = np.zeros(2**N_QUBITS)
+
+for idx in range(2**N_QUBITS):
+    bits = index_to_bits(idx)
+    all_costs[idx] = qubo_cost(bits)
+
+def qaoa_expectation(theta, p):
+    gammas = theta[:p]
+    betas = theta[p:]
+
+    qc = build_qaoa_circuit(gammas, betas, measure=False)
+    sv = Statevector.from_instruction(qc)
+
+    probs = np.abs(sv.data)**2
+    return float(np.dot(probs, all_costs))
+
+def optimize_qaoa(p):
+    best_result = None
+    best_history = None
+
+    for start in range(N_STARTS):
+        history = []
+
+        theta0 = np.concatenate([
+            rng.uniform(-np.pi, np.pi, size=p),
+            rng.uniform(0, np.pi, size=p)
+        ])
+
+        def objective(theta):
+            value = qaoa_expectation(theta, p)
+            history.append(value)
+            return value
+
+        result = minimize(
+            objective,
+            theta0,
+            method="COBYLA",
+            options={"maxiter": MAXITER, "rhobeg": 0.8}
+        )
+
+        print(f"p={p}, start={start+1}, expectation={result.fun:.4f}")
+
+        if best_result is None or result.fun < best_result.fun:
+            best_result = result
+            best_history = history
+
+    return best_result, best_history
+
+qaoa_results = {}
+
+for p in QAOA_DEPTHS:
+    print("\nOptimizing QAOA p =", p)
+    result, history = optimize_qaoa(p)
+
+    qaoa_results[p] = {
+        "result": result,
+        "theta": result.x,
+        "expectation": result.fun,
+        "history": history,
+    }
+
+best_p = min(qaoa_results, key=lambda p: qaoa_results[p]["expectation"])
+best_theta = qaoa_results[best_p]["theta"]
+
+print("\nBest p:", best_p)
+print("Best expectation:", qaoa_results[best_p]["expectation"])
+print("Best theta:", best_theta)
+
+
+# ============================================================
+# 9. FINAL QAOA CIRCUIT
+# ============================================================
+
+gammas_opt = best_theta[:best_p]
+betas_opt = best_theta[best_p:]
+
+final_circuit = build_qaoa_circuit(gammas_opt, betas_opt, measure=True)
+
+print(final_circuit)
+print("Depth:", final_circuit.depth())
+print("Ops:", final_circuit.count_ops())
+
+# ============================================================
+# 10. RUN IDEAL AER SIMULATOR
+# ============================================================
+
+def analyze_counts(counts, label, top_n=20):
+    total = sum(counts.values())
+    rows = []
+
+    for key, count in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:top_n]:
+        bits = key_to_bits(key)
+        raw_assignment = bits_to_assignment(bits)
+        repaired_assignment = repair_bits(bits)
+        repaired_metrics = assignment_metrics(repaired_assignment)
+
+        onehot_violations = 0
+        for i in range(N_USERS):
+            row = bits[i*N_BLOCKS:(i+1)*N_BLOCKS]
+            if np.sum(row) != 1:
+                onehot_violations += 1
+
+        rows.append({
+            "source": label,
+            "bitstring": key,
+            "count": count,
+            "probability": count / total,
+            "raw_assignment": raw_assignment,
+            "raw_cost": qubo_cost(bits),
+            "onehot_violations": onehot_violations,
+            "repaired_assignment": repaired_assignment,
+            "repaired_cost": repaired_metrics["cost"],
+            "repaired_utility": repaired_metrics["utility"],
+            "repaired_conflicts": repaired_metrics["conflicts"],
+            "repaired_loads": repaired_metrics["loads"],
+        })
+
+    return pd.DataFrame(rows)
+
+ideal_sim = AerSimulator(seed_simulator=SEED)
+ideal_result = ideal_sim.run(final_circuit, shots=SHOTS).result()
+ideal_counts = ideal_result.get_counts()
+
+ideal_df = analyze_counts(ideal_counts, "Aer ideal simulator")
+ideal_df.to_csv(OUTDIR / "ideal_aer_results.csv", index=False)
+
+ideal_df.head(10)
+
+# ============================================================
+# 11. CONNECT IBM QUANTUM SERVICE
+# Qiskit 2.3 style / IBM Cloud channel style
+# ============================================================
+
+from qiskit_ibm_runtime import QiskitRuntimeService
+from qiskit_ibm_runtime import SamplerV2
+from qiskit_aer import AerSimulator
+from qiskit import transpile
+
+# ------------------------------------------------------------
+# STEP 11A: Save IBM Cloud account
+# Run this ONCE only.
+# Then comment this block again.
+# ------------------------------------------------------------
+
+IBM_TOKEN = "v4Wbk5-cOVN8vIc1yZvrf2WpNtK71t7pI_XVzC-Spafp"
+
+IBM_INSTANCE = "crn:v1:bluemix:public:quantum-computing:us-east:a/4ff1e7eba1da437a8a8c8d80b7b9bd4b:31ebe751-7d2b-4d32-9d46-f0b3d3283229::"
+
+ACCOUNT_NAME = "qslicenet-ibm-cloud"
+
+QiskitRuntimeService.save_account(
+    token=IBM_TOKEN,
+    channel="ibm_cloud",
+    instance=IBM_INSTANCE,
+    name=ACCOUNT_NAME,
+    overwrite=True
+)
+
+print("IBM Cloud account saved successfully.")
+
+
+# ============================================================
+# 11B. LOAD IBM CREDENTIAL AND SELECT BACKEND
+# ============================================================
+
+from qiskit_ibm_runtime import QiskitRuntimeService
+
+ACCOUNT_NAME = "qslicenet-ibm-cloud"
+IBM_BACKEND_NAME = "ibm_fez"       # change to ibm_torino / ibm_brisbane if needed
+
+ibm_service = QiskitRuntimeService(name=ACCOUNT_NAME)
+
+print("IBM Cloud account loaded successfully.")
+
+# List available backends
+print("\nAvailable IBM hardware backends:")
+available_backends = ibm_service.backends(
+    operational=True,
+    simulator=False,
+    min_num_qubits=N_QUBITS
+)
+
+for b in available_backends:
+    print(" -", b.name, "| qubits:", b.num_qubits)
+
+# Select backend
+available_names = [b.name for b in available_backends]
+
+if IBM_BACKEND_NAME in available_names:
+    ibmq_comp = ibm_service.backend(IBM_BACKEND_NAME)
+else:
+    print(f"\n{IBM_BACKEND_NAME} not available. Selecting least busy backend.")
+    ibmq_comp = ibm_service.least_busy(
+        operational=True,
+        simulator=False,
+        min_num_qubits=N_QUBITS
+    )
+
+print("\nSelected backend:", ibmq_comp.name)
+
+# ============================================================
+# 12. INSTANTIATE AER AND IBM SAMPLERS
+# ============================================================
+
+from qiskit_aer import AerSimulator
+from qiskit_ibm_runtime import SamplerV2
+
+backend_aer = AerSimulator()
+
+sampler_aer = SamplerV2(mode=backend_aer)
+sampler_ibm = SamplerV2(mode=ibmq_comp)
+
+print("Aer sampler ready.")
+print("IBM sampler ready on:", ibmq_comp.name)
+
+# ============================================================
+# 13. TRANSPILE FINAL QAOA CIRCUIT
+# ============================================================
+
+# final_circuit must already exist from your QAOA section
+# final_circuit = build_qaoa_circuit(gammas_opt, betas_opt, measure=True)
+
+final_circuit_aer = transpile(
+    final_circuit,
+    backend=backend_aer,
+    optimization_level=1,
+    seed_transpiler=SEED
+)
+
+final_circuit_ibm = transpile(
+    final_circuit,
+    backend=ibmq_comp,
+    optimization_level=1,
+    seed_transpiler=SEED
+)
+
+print("Aer circuit depth:", final_circuit_aer.depth())
+print("Aer circuit ops:", final_circuit_aer.count_ops())
+
+print("\nIBM circuit depth:", final_circuit_ibm.depth())
+print("IBM circuit ops:", final_circuit_ibm.count_ops())
+
+# ============================================================
+# 14. RUN QAOA ON AER SIMULATOR USING SAMPLER V2 PUB
+# ============================================================
+
+SHOTS = 4096
+
+job_aer = sampler_aer.run([
+    (final_circuit_aer, None, SHOTS)
+])
+
+result_aer = job_aer.result()
+
+counts_aer = result_aer[0].data.meas.get_counts(0)
+
+print("Aer counts:")
+print(counts_aer)
+
+ideal_df = analyze_counts(
+    counts_aer,
+    "Aer simulator"
+)
+
+ideal_df.to_csv(
+    OUTDIR / "qaoa_aer_sampler_results.csv",
+    index=False
+)
+
+display(ideal_df.head(10))
+
+# ============================================================
+# 15. RUN QAOA ON REAL IBM BACKEND USING SAMPLER V2 PUB
+# ============================================================
+
+RUN_REAL_IBM_BACKEND = False   # change to True when ready
+
+if RUN_REAL_IBM_BACKEND:
+    
+    job_ibm = sampler_ibm.run([
+        (final_circuit_ibm, None, SHOTS)
+    ])
+
+    print("IBM job submitted.")
+    print("Job ID:", job_ibm.job_id())
+    print("Status:", job_ibm.status())
+
+    result_ibm = job_ibm.result()
+
+    counts_ibm = result_ibm[0].data.meas.get_counts(0)
+
+    print("IBM counts:")
+    print(counts_ibm)
+
+    hardware_df = analyze_counts(
+        counts_ibm,
+        f"IBM hardware {ibmq_comp.name}"
+    )
+
+    hardware_df.to_csv(
+        OUTDIR / f"qaoa_{ibmq_comp.name}_hardware_results.csv",
+        index=False
+    )
+
+    with open(OUTDIR / "ibm_job_id.txt", "w") as f:
+        f.write(job_ibm.job_id())
+
+    display(hardware_df.head(10))
+
+else:
+    print("RUN_REAL_IBM_BACKEND = False")
+    print("Real IBM hardware job was not submitted.")
+
+
+# ============================================================
+# 16. IBM BACKEND NOISE SIMULATOR
+# ============================================================
+
+RUN_IBM_NOISE_SIMULATOR = True
+
+if RUN_IBM_NOISE_SIMULATOR:
+
+    noisy_backend = AerSimulator.from_backend(ibmq_comp)
+
+    sampler_noise = SamplerV2(mode=noisy_backend)
+
+    final_circuit_noise = transpile(
+        final_circuit,
+        backend=noisy_backend,
+        optimization_level=1,
+        seed_transpiler=SEED
+    )
+
+    print("Noise simulator circuit depth:", final_circuit_noise.depth())
+    print("Noise simulator circuit ops:", final_circuit_noise.count_ops())
+
+    job_noise = sampler_noise.run([
+        (final_circuit_noise, None, SHOTS)
+    ])
+
+    result_noise = job_noise.result()
+
+    counts_noise = result_noise[0].data.meas.get_counts(0)
+
+    print("Noise simulator counts:")
+    print(counts_noise)
+
+    noise_df = analyze_counts(
+        counts_noise,
+        f"Noisy simulator from {ibmq_comp.name}"
+    )
+
+    noise_df.to_csv(
+        OUTDIR / f"qaoa_{ibmq_comp.name}_noise_simulator_results.csv",
+        index=False
+    )
+
+    display(noise_df.head(10))
+
+else:
+    print("RUN_IBM_NOISE_SIMULATOR = False")
+
+
+# ============================================================
+# 15A. FIX SHOTS + ROBUST COUNTS EXTRACTOR
+# ============================================================
+
+SHOTS = 4096
+print("Using SHOTS =", SHOTS)
+
+def extract_counts_sampler_v2(result, pub_index=0):
+    """
+    Robust SamplerV2 counts extractor.
+    Works for measure_all() register name 'meas'.
+    Does not force get_counts(0), because for non-parametric circuits
+    get_counts() is safer.
+    """
+    pub_result = result[pub_index]
+    data = pub_result.data
+
+    # Most common when using measure_all()
+    if hasattr(data, "meas"):
+        try:
+            return data.meas.get_counts()
+        except TypeError:
+            return data.meas.get_counts(0)
+
+    # If classical register has another name
+    for reg_name in dir(data):
+        reg = getattr(data, reg_name)
+        if hasattr(reg, "get_counts"):
+            try:
+                return reg.get_counts()
+            except TypeError:
+                return reg.get_counts(0)
+
+    raise RuntimeError("Could not extract counts from SamplerV2 result.")
+
+
+def print_counts_summary(counts, label):
+    total = sum(counts.values())
+    print(f"\n{label}")
+    print("Total shots returned:", total)
+    print("Number of unique bitstrings:", len(counts))
+    print("Top 10 counts:")
+    for bit, c in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+        print(bit, c, "prob =", c / total)
+
+# ============================================================
+# 16. IBM-FEZ NOISE SIMULATOR WITH CORRECT SHOTS
+# ============================================================
+
+RUN_IBM_NOISE_SIMULATOR = True
+
+if RUN_IBM_NOISE_SIMULATOR:
+
+    noisy_backend = AerSimulator.from_backend(ibmq_comp)
+    sampler_noise = SamplerV2(mode=noisy_backend)
+
+    final_circuit_noise = transpile(
+        final_circuit,
+        backend=noisy_backend,
+        optimization_level=1,
+        seed_transpiler=SEED
+    )
+
+    print("Noise simulator circuit depth:", final_circuit_noise.depth())
+    print("Noise simulator circuit ops:", final_circuit_noise.count_ops())
+
+    job_noise = sampler_noise.run(
+        [final_circuit_noise],
+        shots=SHOTS
+    )
+
+    result_noise = job_noise.result()
+    counts_noise = extract_counts_sampler_v2(result_noise)
+
+    print_counts_summary(counts_noise, f"NOISE SIMULATOR FROM {ibmq_comp.name}")
+
+    noise_df = analyze_counts(
+        counts_noise,
+        f"Noisy simulator from {ibmq_comp.name}"
+    )
+
+    noise_df.to_csv(
+        OUTDIR / f"qaoa_{ibmq_comp.name}_noise_simulator_results_fixed.csv",
+        index=False
+    )
+
+    display(noise_df.head(15))
+
+else:
+    print("Noise simulator skipped.")
+
+# ============================================================
+# FIX: CREATE aer_df IF NOT ALREADY CREATED
+# ============================================================
+
+# If counts_aer exists but aer_df does not exist, create aer_df
+try:
+    aer_df
+    print("aer_df already exists.")
+except NameError:
+    print("aer_df not found. Creating aer_df now...")
+
+    try:
+        counts_aer
+        print("counts_aer found.")
+    except NameError:
+        raise NameError(
+            "counts_aer is also missing. First rerun your Aer Sampler cell."
+        )
+
+    aer_df = analyze_counts(
+        counts_aer,
+        "QAOA Aer ideal"
+    )
+
+    aer_df.to_csv(
+        OUTDIR / "qaoa_aer_sampler_results_fixed.csv",
+        index=False
+    )
+
+    display(aer_df.head(15))
+# ============================================================
+# BENCHMARK SUMMARY: CLASSICAL VS AER VS IBM NOISY SIM
+# ============================================================
+
+def best_result_from_df(df, method_name):
+    best = df.sort_values("repaired_cost").iloc[0]
+
+    return {
+        "method": method_name,
+        "assignment": best["repaired_assignment"],
+        "cost": best["repaired_cost"],
+        "utility": best["repaired_utility"],
+        "conflicts": best["repaired_conflicts"],
+        "loads": best["repaired_loads"],
+        "top_bitstring": best["bitstring"],
+        "probability": best["probability"],
+        "onehot_violations": best["onehot_violations"],
+    }
+
+
+summary_rows = []
+
+summary_rows.append({
+    "method": "Random baseline",
+    "assignment": random_best["assignment"],
+    "cost": random_best["cost"],
+    "utility": random_best["utility"],
+    "conflicts": random_best["conflicts"],
+    "loads": random_best["loads"],
+    "top_bitstring": None,
+    "probability": None,
+    "onehot_violations": 0,
+})
+
+summary_rows.append({
+    "method": "Greedy baseline",
+    "assignment": greedy_best["assignment"],
+    "cost": greedy_best["cost"],
+    "utility": greedy_best["utility"],
+    "conflicts": greedy_best["conflicts"],
+    "loads": greedy_best["loads"],
+    "top_bitstring": None,
+    "probability": None,
+    "onehot_violations": 0,
+})
+
+summary_rows.append({
+    "method": "Brute force exact",
+    "assignment": brute_best["assignment"],
+    "cost": brute_best["cost"],
+    "utility": brute_best["utility"],
+    "conflicts": brute_best["conflicts"],
+    "loads": brute_best["loads"],
+    "top_bitstring": None,
+    "probability": None,
+    "onehot_violations": 0,
+})
+
+summary_rows.append(
+    best_result_from_df(aer_df, "QAOA Aer ideal")
+)
+
+# Add noisy simulator only if noise_df exists
+try:
+    noise_df
+    summary_rows.append(
+        best_result_from_df(
+            noise_df,
+            f"QAOA noisy simulator {ibmq_comp.name}"
+        )
+    )
+except NameError:
+    print("noise_df not found, skipping noisy simulator result.")
+
+summary_df = pd.DataFrame(summary_rows)
+
+summary_df.to_csv(
+    OUTDIR / "benchmark_summary_aer_noise.csv",
+    index=False
+)
+
+display(summary_df)
+
+# ============================================================
+# EXTRA METRICS FOR Q-SLICENET BENCHMARK
+# ============================================================
+
+OPTIMAL_ASSIGNMENT = brute_best["assignment"]
+OPTIMAL_COST = brute_best["cost"]
+
+def extended_sampling_metrics(counts, label):
+    total = sum(counts.values())
+
+    feasible_shots = 0
+    optimal_raw_shots = 0
+    optimal_repaired_shots = 0
+
+    raw_costs = []
+    repaired_costs = []
+
+    best_raw_cost = None
+    best_repaired_cost = None
+    best_raw_bitstring = None
+    best_repaired_bitstring = None
+
+    for bitstring, count in counts.items():
+        bits = key_to_bits(bitstring)
+
+        raw_assign = bits_to_assignment(bits)
+        repaired_assign = repair_bits(bits)
+
+        raw_cost = qubo_cost(bits)
+        repaired_cost = assignment_metrics(repaired_assign)["cost"]
+
+        raw_costs.extend([raw_cost] * count)
+        repaired_costs.extend([repaired_cost] * count)
+
+        if raw_assign is not None:
+            feasible_shots += count
+
+            if raw_assign == OPTIMAL_ASSIGNMENT:
+                optimal_raw_shots += count
+
+        if repaired_assign == OPTIMAL_ASSIGNMENT:
+            optimal_repaired_shots += count
+
+        if best_raw_cost is None or raw_cost < best_raw_cost:
+            best_raw_cost = raw_cost
+            best_raw_bitstring = bitstring
+
+        if best_repaired_cost is None or repaired_cost < best_repaired_cost:
+            best_repaired_cost = repaired_cost
+            best_repaired_bitstring = bitstring
+
+    return {
+        "method": label,
+        "shots": total,
+        "unique_bitstrings": len(counts),
+        "feasible_probability": feasible_shots / total,
+        "optimal_raw_probability": optimal_raw_shots / total,
+        "optimal_repaired_probability": optimal_repaired_shots / total,
+        "mean_raw_cost": float(np.mean(raw_costs)),
+        "mean_repaired_cost": float(np.mean(repaired_costs)),
+        "best_raw_cost": best_raw_cost,
+        "best_repaired_cost": best_repaired_cost,
+        "best_raw_bitstring": best_raw_bitstring,
+        "best_repaired_bitstring": best_repaired_bitstring,
+        "approximation_gap_repaired": best_repaired_cost - OPTIMAL_COST,
+    }
+
+
+metric_rows = []
+
+metric_rows.append(
+    extended_sampling_metrics(counts_aer, "QAOA Aer")
+)
+
+if "counts_noise" in globals():
+    metric_rows.append(
+        extended_sampling_metrics(counts_noise, f"QAOA noisy simulator {ibmq_comp.name}")
+    )
+
+if "counts_ibm" in globals():
+    metric_rows.append(
+        extended_sampling_metrics(counts_ibm, f"QAOA IBM hardware {ibmq_comp.name}")
+    )
+
+extended_metrics_df = pd.DataFrame(metric_rows)
+
+extended_metrics_df.to_csv(
+    OUTDIR / "extended_sampling_metrics.csv",
+    index=False
+)
+
+display(extended_metrics_df)
+
+# ============================================================
+# FIX: DEFINE Q-MATRIX TOP COUPLINGS + CORRELATION GRAPH
+# ============================================================
+
+def qmatrix_top_couplings(top_n=30):
+    """
+    Extract strongest QUBO couplings from the quadratic Q matrix.
+    Strong positive coupling means two binary allocation decisions
+    are penalized when selected together.
+    """
+
+    rows = []
+
+    for i in range(N_QUBITS):
+        for j in range(i + 1, N_QUBITS):
+
+            q = quadratic[i, j]
+
+            if abs(q) > 1e-12:
+
+                # If zz_couplings exists, include Ising ZZ coupling
+                if "zz_couplings" in globals():
+                    zz_value = zz_couplings[i, j]
+                else:
+                    zz_value = np.nan
+
+                rows.append({
+                    "var_i": i,
+                    "var_j": j,
+                    "label_i": var_label(i),
+                    "label_j": var_label(j),
+                    "QUBO_coupling": q,
+                    "Ising_ZZ_coupling": zz_value,
+                    "abs_coupling": abs(q),
+                })
+
+    df = pd.DataFrame(rows)
+
+    if len(df) == 0:
+        raise ValueError("No QUBO couplings found. Check your quadratic matrix.")
+
+    df = df.sort_values("abs_coupling", ascending=False)
+
+    return df.head(top_n).reset_index(drop=True)
+
+
+# Create and save coupling table
+qmatrix_df = qmatrix_top_couplings(top_n=40)
+
+qmatrix_df.to_csv(
+    OUTDIR / "qmatrix_top_couplings.csv",
+    index=False
+)
+
+display(qmatrix_df.head(15))
+
+
+# ============================================================
+# Q-SLICENET Q-MATRIX CORRELATION GRAPH
+# ============================================================
+
+def plot_qmatrix_correlation_graph(top_n=25):
+    """
+    Plot strongest QUBO correlations/couplings.
+    
+    Node  = binary allocation variable, e.g. U1R1
+    Edge  = QUBO coupling between two variables
+    Weight = penalty strength
+    """
+
+    coupling_df = qmatrix_top_couplings(top_n=top_n)
+
+    G = nx.Graph()
+
+    for _, row in coupling_df.iterrows():
+
+        a = row["label_i"]
+        b = row["label_j"]
+        weight = float(row["QUBO_coupling"])
+
+        G.add_node(a)
+        G.add_node(b)
+        G.add_edge(a, b, weight=weight)
+
+    pos = nx.spring_layout(G, seed=SEED)
+
+    edge_weights = [G[u][v]["weight"] for u, v in G.edges()]
+    max_w = max(edge_weights)
+
+    widths = [1.0 + 4.0 * (w / max_w) for w in edge_weights]
+
+    plt.figure(figsize=(11, 7))
+
+    nx.draw_networkx_nodes(
+        G,
+        pos,
+        node_size=900,
+        node_color="lightgreen",
+        edgecolors="black"
+    )
+
+    nx.draw_networkx_edges(
+        G,
+        pos,
+        width=widths,
+        alpha=0.75
+    )
+
+    nx.draw_networkx_labels(
+        G,
+        pos,
+        font_size=8,
+        font_weight="bold"
+    )
+
+    edge_labels = {
+        (u, v): f"{G[u][v]['weight']:.1f}"
+        for u, v in G.edges()
+    }
+
+    nx.draw_networkx_edge_labels(
+        G,
+        pos,
+        edge_labels=edge_labels,
+        font_size=7
+    )
+
+    plt.title(
+        "Q-SliceNet Q-Matrix Correlation Graph\n"
+        "Strong edges = strong QUBO penalties between allocation decisions"
+    )
+
+    plt.axis("off")
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTDIR / "qmatrix_correlation_graph.png",
+        dpi=300
+    )
+
+    plt.show()
+
+
+plot_qmatrix_correlation_graph(top_n=25)
+
+# ============================================================
+# FINAL EXTENDED SAMPLING METRICS
+# ============================================================
+
+OPTIMAL_ASSIGNMENT = brute_best["assignment"]
+OPTIMAL_COST = brute_best["cost"]
+
+def extended_sampling_metrics(counts, label):
+    total = sum(counts.values())
+
+    feasible_shots = 0
+    optimal_raw_shots = 0
+    optimal_repaired_shots = 0
+
+    raw_cost_sum = 0.0
+    repaired_cost_sum = 0.0
+
+    best_raw_cost = None
+    best_repaired_cost = None
+    best_raw_bitstring = None
+    best_repaired_bitstring = None
+
+    for bitstring, count in counts.items():
+        bits = key_to_bits(bitstring)
+
+        raw_assign = bits_to_assignment(bits)
+        repaired_assign = repair_bits(bits)
+
+        raw_cost = qubo_cost(bits)
+        repaired_metrics = assignment_metrics(repaired_assign)
+        repaired_cost = repaired_metrics["cost"]
+
+        raw_cost_sum += raw_cost * count
+        repaired_cost_sum += repaired_cost * count
+
+        if raw_assign is not None:
+            feasible_shots += count
+            if raw_assign == OPTIMAL_ASSIGNMENT:
+                optimal_raw_shots += count
+
+        if repaired_assign == OPTIMAL_ASSIGNMENT:
+            optimal_repaired_shots += count
+
+        if best_raw_cost is None or raw_cost < best_raw_cost:
+            best_raw_cost = raw_cost
+            best_raw_bitstring = bitstring
+
+        if best_repaired_cost is None or repaired_cost < best_repaired_cost:
+            best_repaired_cost = repaired_cost
+            best_repaired_bitstring = bitstring
+
+    return {
+        "method": label,
+        "shots": total,
+        "unique_bitstrings": len(counts),
+        "feasible_probability": feasible_shots / total,
+        "optimal_raw_probability": optimal_raw_shots / total,
+        "optimal_repaired_probability": optimal_repaired_shots / total,
+        "mean_raw_cost": raw_cost_sum / total,
+        "mean_repaired_cost": repaired_cost_sum / total,
+        "best_raw_cost": best_raw_cost,
+        "best_repaired_cost": best_repaired_cost,
+        "best_raw_bitstring": best_raw_bitstring,
+        "best_repaired_bitstring": best_repaired_bitstring,
+        "approximation_gap_repaired": best_repaired_cost - OPTIMAL_COST,
+    }
+
+
+metric_rows = []
+
+if "counts_aer" in globals():
+    metric_rows.append(
+        extended_sampling_metrics(counts_aer, "QAOA Aer")
+    )
+
+if "counts_noise" in globals():
+    metric_rows.append(
+        extended_sampling_metrics(counts_noise, f"QAOA noisy simulator {ibmq_comp.name}")
+    )
+
+if "counts_ibm" in globals():
+    metric_rows.append(
+        extended_sampling_metrics(counts_ibm, f"QAOA IBM hardware {ibmq_comp.name}")
+    )
+
+extended_metrics_df = pd.DataFrame(metric_rows)
+
+extended_metrics_df.to_csv(
+    OUTDIR / "extended_sampling_metrics.csv",
+    index=False
+)
+
+display(extended_metrics_df)
+
+# ============================================================
+# PICTURE 1: Q-MATRIX CORRELATION GRAPH
+# ============================================================
+
+def qmatrix_top_couplings(top_n=30):
+    rows = []
+
+    for i in range(N_QUBITS):
+        for j in range(i + 1, N_QUBITS):
+            q = quadratic[i, j]
+
+            if abs(q) > 1e-12:
+                zz_value = zz_couplings[i, j] if "zz_couplings" in globals() else np.nan
+
+                rows.append({
+                    "var_i": i,
+                    "var_j": j,
+                    "label_i": var_label(i),
+                    "label_j": var_label(j),
+                    "QUBO_coupling": q,
+                    "Ising_ZZ_coupling": zz_value,
+                    "abs_coupling": abs(q),
+                })
+
+    df = pd.DataFrame(rows)
+
+    if len(df) == 0:
+        raise ValueError("No QUBO couplings found.")
+
+    return df.sort_values("abs_coupling", ascending=False).head(top_n)
+
+
+def plot_qmatrix_correlation_graph(top_n=25):
+    coupling_df = qmatrix_top_couplings(top_n=top_n)
+
+    G = nx.Graph()
+
+    for _, row in coupling_df.iterrows():
+        a = row["label_i"]
+        b = row["label_j"]
+        weight = float(row["QUBO_coupling"])
+
+        G.add_node(a)
+        G.add_node(b)
+        G.add_edge(a, b, weight=weight)
+
+    pos = nx.spring_layout(G, seed=SEED)
+
+    edge_weights = [G[u][v]["weight"] for u, v in G.edges()]
+    max_w = max(edge_weights)
+    widths = [1 + 4 * (w / max_w) for w in edge_weights]
+
+    plt.figure(figsize=(11, 7))
+
+    nx.draw_networkx_nodes(
+        G,
+        pos,
+        node_size=900,
+        node_color="lightgreen",
+        edgecolors="black"
+    )
+
+    nx.draw_networkx_edges(
+        G,
+        pos,
+        width=widths,
+        alpha=0.75
+    )
+
+    nx.draw_networkx_labels(
+        G,
+        pos,
+        font_size=8,
+        font_weight="bold"
+    )
+
+    edge_labels = {
+        (u, v): f"{G[u][v]['weight']:.1f}"
+        for u, v in G.edges()
+    }
+
+    nx.draw_networkx_edge_labels(
+        G,
+        pos,
+        edge_labels=edge_labels,
+        font_size=7
+    )
+
+    plt.title(
+        "Q-SliceNet Q-Matrix Correlation Graph\n"
+        "Strong edges = strong QUBO penalties between allocation decisions"
+    )
+
+    plt.axis("off")
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTDIR / "01_qmatrix_correlation_graph.png",
+        dpi=300
+    )
+
+    plt.show()
+
+
+plot_qmatrix_correlation_graph(top_n=25)
+
+# ============================================================
+# PICTURE 2: FINAL 5G RESOURCE ALLOCATION GRAPH
+# ============================================================
+
+def plot_final_allocation_graph(assign, title, filename):
+    G = nx.Graph()
+
+    for i in range(N_USERS):
+        G.add_node(i)
+
+    for i, j, w in interference_edges:
+        G.add_edge(i, j, weight=w)
+
+    pos = nx.spring_layout(G, seed=SEED)
+
+    color_map = {
+        0: "#5DADE2",   # R1
+        1: "#58D68D",   # R2
+        2: "#F5B041",   # R3
+    }
+
+    node_colors = [color_map[assign[i]] for i in range(N_USERS)]
+
+    plt.figure(figsize=(8, 6))
+
+    nx.draw_networkx_nodes(
+        G,
+        pos,
+        node_color=node_colors,
+        node_size=1400,
+        edgecolors="black"
+    )
+
+    labels = {
+        i: f"U{i+1}\nR{assign[i]+1}"
+        for i in range(N_USERS)
+    }
+
+    nx.draw_networkx_labels(
+        G,
+        pos,
+        labels=labels,
+        font_size=11,
+        font_weight="bold"
+    )
+
+    widths = [2.5 * G[u][v]["weight"] for u, v in G.edges()]
+
+    nx.draw_networkx_edges(
+        G,
+        pos,
+        width=widths,
+        alpha=0.65
+    )
+
+    edge_labels = {
+        (u, v): f"{G[u][v]['weight']:.1f}"
+        for u, v in G.edges()
+    }
+
+    nx.draw_networkx_edge_labels(
+        G,
+        pos,
+        edge_labels=edge_labels,
+        font_size=9
+    )
+
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTDIR / filename,
+        dpi=300
+    )
+
+    plt.show()
+
+
+plot_final_allocation_graph(
+    brute_best["assignment"],
+    "Optimal 5G Resource Allocation: Brute Force",
+    "02_final_allocation_bruteforce.png"
+)
+
+if "summary_df" in globals():
+    qaoa_assignment = summary_df[summary_df["method"].str.contains("QAOA", case=False)].iloc[0]["assignment"]
+
+    plot_final_allocation_graph(
+        qaoa_assignment,
+        "QAOA-Repaired Final 5G Resource Allocation",
+        "03_final_allocation_qaoa_repaired.png"
+    )
+
+# ============================================================
+# PICTURE 3: QAOA PROBABILITY DISTRIBUTION
+# ============================================================
+
+def plot_probability_distribution_from_df(df, title, filename):
+    top = df.sort_values("probability", ascending=False).head(15)
+
+    plt.figure(figsize=(11, 5))
+
+    plt.bar(
+        range(len(top)),
+        top["probability"],
+        color="#5DADE2",
+        edgecolor="black"
+    )
+
+    plt.xticks(
+        range(len(top)),
+        top["bitstring"],
+        rotation=75,
+        ha="right",
+        fontsize=8
+    )
+
+    plt.ylabel("Probability")
+    plt.title(title)
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTDIR / filename,
+        dpi=300
+    )
+
+    plt.show()
+
+
+if "aer_df" in globals():
+    plot_probability_distribution_from_df(
+        aer_df,
+        "QAOA Aer Simulator: Top Bitstring Probabilities",
+        "04_qaoa_aer_probabilities.png"
+    )
+
+if "noise_df" in globals():
+    plot_probability_distribution_from_df(
+        noise_df,
+        f"QAOA Noisy Simulator from {ibmq_comp.name}: Top Bitstring Probabilities",
+        "05_qaoa_noise_probabilities.png"
+    )
+
+if "hardware_df" in globals():
+    plot_probability_distribution_from_df(
+        hardware_df,
+        f"QAOA IBM Hardware {ibmq_comp.name}: Top Bitstring Probabilities",
+        "06_qaoa_hardware_probabilities.png"
+    )
+
+# ============================================================
+# PICTURE 4: PERFORMANCE METRICS COMPARISON
+# ============================================================
+
+def plot_result_metrics_comparison(summary_df):
+    df = summary_df.copy()
+
+    methods = df["method"].tolist()
+    utility_vals = df["utility"].astype(float).tolist()
+    cost_vals = df["cost"].astype(float).tolist()
+    conflict_vals = df["conflicts"].astype(float).tolist()
+
+    cost_efficiency = [-c for c in cost_vals]
+
+    x = np.arange(len(methods))
+    width = 0.25
+
+    plt.figure(figsize=(12, 6))
+
+    plt.bar(
+        x - width,
+        utility_vals,
+        width,
+        label="Utility",
+        color="#58D68D",
+        edgecolor="black"
+    )
+
+    plt.bar(
+        x,
+        cost_efficiency,
+        width,
+        label="Cost Efficiency (-Cost)",
+        color="#5DADE2",
+        edgecolor="black"
+    )
+
+    plt.bar(
+        x + width,
+        conflict_vals,
+        width,
+        label="Interference Conflicts",
+        color="#EC7063",
+        edgecolor="black"
+    )
+
+    plt.xticks(x, methods, rotation=35, ha="right")
+    plt.ylabel("Score")
+    plt.title("Q-SliceNet Performance Metrics Comparison")
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTDIR / "07_performance_metrics_comparison.png",
+        dpi=300
+    )
+
+    plt.show()
+
+
+plot_result_metrics_comparison(summary_df)
+
+# ============================================================
+# PICTURE 5: FEASIBILITY AND OPTIMAL PROBABILITY
+# ============================================================
+
+def plot_feasibility_probability(metrics_df):
+    labels = metrics_df["method"]
+
+    feasible = metrics_df["feasible_probability"]
+    optimal_raw = metrics_df["optimal_raw_probability"]
+    optimal_repaired = metrics_df["optimal_repaired_probability"]
+
+    x = np.arange(len(labels))
+    width = 0.25
+
+    plt.figure(figsize=(11, 5))
+
+    plt.bar(
+        x - width,
+        feasible,
+        width,
+        label="Feasible Raw Probability",
+        color="#5DADE2",
+        edgecolor="black"
+    )
+
+    plt.bar(
+        x,
+        optimal_raw,
+        width,
+        label="Optimal Raw Probability",
+        color="#F5B041",
+        edgecolor="black"
+    )
+
+    plt.bar(
+        x + width,
+        optimal_repaired,
+        width,
+        label="Optimal Repaired Probability",
+        color="#58D68D",
+        edgecolor="black"
+    )
+
+    plt.xticks(x, labels, rotation=30, ha="right")
+    plt.ylabel("Probability")
+    plt.ylim(0, 1)
+    plt.title("QAOA Sampling Quality: Feasibility and Optimal Recovery")
+    plt.legend()
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTDIR / "08_feasibility_optimal_probability.png",
+        dpi=300
+    )
+
+    plt.show()
+
+
+plot_feasibility_probability(extended_metrics_df)
+
+# ============================================================
+# PICTURE 6: CIRCUIT DEPTH AND TWO-QUBIT GATE COMPARISON
+# ============================================================
+
+depth_rows = []
+
+if "final_circuit_aer" in globals():
+    depth_rows.append({
+        "backend": "Aer",
+        "depth": final_circuit_aer.depth(),
+        "two_qubit_gates": final_circuit_aer.count_ops().get("cx", 0)
+    })
+
+if "final_circuit_ibm" in globals():
+    ops = final_circuit_ibm.count_ops()
+
+    depth_rows.append({
+        "backend": ibmq_comp.name,
+        "depth": final_circuit_ibm.depth(),
+        "two_qubit_gates": ops.get("cz", 0) + ops.get("cx", 0)
+    })
+
+depth_df = pd.DataFrame(depth_rows)
+
+depth_df.to_csv(
+    OUTDIR / "circuit_depth_summary.csv",
+    index=False
+)
+
+display(depth_df)
+
+x = np.arange(len(depth_df))
+width = 0.35
+
+plt.figure(figsize=(8, 5))
+
+plt.bar(
+    x - width/2,
+    depth_df["depth"],
+    width,
+    label="Circuit Depth",
+    color="#AF7AC5",
+    edgecolor="black"
+)
+
+plt.bar(
+    x + width/2,
+    depth_df["two_qubit_gates"],
+    width,
+    label="Two-Qubit Gates",
+    color="#EC7063",
+    edgecolor="black"
+)
+
+plt.xticks(x, depth_df["backend"])
+plt.ylabel("Count")
+plt.title("Circuit Complexity After Transpilation")
+plt.legend()
+plt.tight_layout()
+
+plt.savefig(
+    OUTDIR / "09_circuit_complexity.png",
+    dpi=300
+)
+
+plt.show()
+
+# ============================================================
+# OPTIONAL: CREATE FINAL DASHBOARD IMAGE
+# ============================================================
+
+from PIL import Image, ImageOps, ImageDraw
+
+image_files = [
+    "01_qmatrix_correlation_graph.png",
+    "02_final_allocation_bruteforce.png",
+    "04_qaoa_aer_probabilities.png",
+    "07_performance_metrics_comparison.png",
+    "08_feasibility_optimal_probability.png",
+    "09_circuit_complexity.png",
+]
+
+images = []
+
+for file in image_files:
+    path = OUTDIR / file
+    if path.exists():
+        img = Image.open(path).convert("RGB")
+        img = ImageOps.contain(img, (700, 420))
+        canvas = Image.new("RGB", (700, 420), "white")
+        canvas.paste(img, ((700 - img.width)//2, (420 - img.height)//2))
+        images.append(canvas)
+
+if len(images) > 0:
+    cols = 2
+    rows = int(np.ceil(len(images) / cols))
+
+    dashboard = Image.new("RGB", (cols * 700, rows * 420), "white")
+
+    for idx, img in enumerate(images):
+        r = idx // cols
+        c = idx % cols
+        dashboard.paste(img, (c * 700, r * 420))
+
+    dashboard.save(OUTDIR / "FINAL_qslicenet_results_dashboard.png")
+
+    display(dashboard)
+
+# ============================================================
+# REAL IBM QPU RUN: Q-SLICENET ON ibm_fez
+# ============================================================
+
+RUN_REAL_IBM_BACKEND = True
+SHOTS = 4096
+
+print("Preparing real QPU run...")
+print("Backend:", ibmq_comp.name)
+print("Shots:", SHOTS)
+print("Circuit depth:", final_circuit_ibm.depth())
+print("Circuit ops:", final_circuit_ibm.count_ops())
+
+if RUN_REAL_IBM_BACKEND:
+
+    job_ibm = sampler_ibm.run(
+        [final_circuit_ibm],
+        shots=SHOTS
+    )
+
+    print("\nIBM QPU job submitted successfully.")
+    print("Job ID:", job_ibm.job_id())
+    print("Initial status:", job_ibm.status())
+
+else:
+    print("RUN_REAL_IBM_BACKEND = False")
+
+# ============================================================
+# RETRIEVE REAL IBM QPU RESULT
+# ============================================================
+
+def extract_counts_sampler_v2(result, pub_index=0):
+    """
+    Robust counts extractor for SamplerV2.
+    Works with measure_all(), usually register name = meas.
+    """
+
+    pub_result = result[pub_index]
+    data = pub_result.data
+
+    if hasattr(data, "meas"):
+        try:
+            return data.meas.get_counts()
+        except TypeError:
+            return data.meas.get_counts(0)
+
+    if hasattr(data, "c"):
+        try:
+            return data.c.get_counts()
+        except TypeError:
+            return data.c.get_counts(0)
+
+    for reg_name in dir(data):
+        reg = getattr(data, reg_name)
+        if hasattr(reg, "get_counts"):
+            try:
+                return reg.get_counts()
+            except TypeError:
+                return reg.get_counts(0)
+
+    raise RuntimeError("Could not extract counts from SamplerV2 result.")
+
+
+print("Waiting for IBM QPU result...")
+result_ibm = job_ibm.result()
+
+counts_ibm = extract_counts_sampler_v2(result_ibm)
+
+print("\nREAL IBM QPU COUNTS SUMMARY")
+print("Backend:", ibmq_comp.name)
+print("Total shots:", sum(counts_ibm.values()))
+print("Unique bitstrings:", len(counts_ibm))
+
+print("\nTop 10 measured bitstrings:")
+for bitstring, count in sorted(counts_ibm.items(), key=lambda x: x[1], reverse=True)[:10]:
+    print(bitstring, count, "prob =", count / sum(counts_ibm.values()))
+
+# ============================================================
+# ANALYZE REAL IBM QPU RESULT
+# ============================================================
+
+hardware_df = analyze_counts(
+    counts_ibm,
+    f"IBM QPU {ibmq_comp.name}"
+)
+
+hardware_df.to_csv(
+    OUTDIR / f"qaoa_{ibmq_comp.name}_REAL_QPU_results.csv",
+    index=False
+)
+
+with open(OUTDIR / "REAL_IBM_QPU_job_id.txt", "w") as f:
+    f.write(job_ibm.job_id())
+
+display(hardware_df.head(20))
+
+# ============================================================
+# EXTENDED METRICS FOR REAL IBM QPU
+# ============================================================
+
+OPTIMAL_ASSIGNMENT = brute_best["assignment"]
+OPTIMAL_COST = brute_best["cost"]
+
+def extended_sampling_metrics(counts, label):
+    total = sum(counts.values())
+
+    feasible_shots = 0
+    optimal_raw_shots = 0
+    optimal_repaired_shots = 0
+
+    raw_cost_sum = 0.0
+    repaired_cost_sum = 0.0
+
+    best_raw_cost = None
+    best_repaired_cost = None
+    best_raw_bitstring = None
+    best_repaired_bitstring = None
+
+    for bitstring, count in counts.items():
+        bits = key_to_bits(bitstring)
+
+        raw_assign = bits_to_assignment(bits)
+        repaired_assign = repair_bits(bits)
+
+        raw_cost = qubo_cost(bits)
+        repaired_cost = assignment_metrics(repaired_assign)["cost"]
+
+        raw_cost_sum += raw_cost * count
+        repaired_cost_sum += repaired_cost * count
+
+        if raw_assign is not None:
+            feasible_shots += count
+
+            if raw_assign == OPTIMAL_ASSIGNMENT:
+                optimal_raw_shots += count
+
+        if repaired_assign == OPTIMAL_ASSIGNMENT:
+            optimal_repaired_shots += count
+
+        if best_raw_cost is None or raw_cost < best_raw_cost:
+            best_raw_cost = raw_cost
+            best_raw_bitstring = bitstring
+
+        if best_repaired_cost is None or repaired_cost < best_repaired_cost:
+            best_repaired_cost = repaired_cost
+            best_repaired_bitstring = bitstring
+
+    return {
+        "method": label,
+        "shots": total,
+        "unique_bitstrings": len(counts),
+        "feasible_probability": feasible_shots / total,
+        "optimal_raw_probability": optimal_raw_shots / total,
+        "optimal_repaired_probability": optimal_repaired_shots / total,
+        "mean_raw_cost": raw_cost_sum / total,
+        "mean_repaired_cost": repaired_cost_sum / total,
+        "best_raw_cost": best_raw_cost,
+        "best_repaired_cost": best_repaired_cost,
+        "best_raw_bitstring": best_raw_bitstring,
+        "best_repaired_bitstring": best_repaired_bitstring,
+        "approximation_gap_repaired": best_repaired_cost - OPTIMAL_COST,
+    }
+
+
+hardware_metrics = extended_sampling_metrics(
+    counts_ibm,
+    f"IBM QPU {ibmq_comp.name}"
+)
+
+hardware_metrics_df = pd.DataFrame([hardware_metrics])
+
+hardware_metrics_df.to_csv(
+    OUTDIR / f"extended_metrics_REAL_QPU_{ibmq_comp.name}.csv",
+    index=False
+)
+
+display(hardware_metrics_df)
+
+# ============================================================
+# FINAL BENCHMARK INCLUDING REAL IBM QPU
+# ============================================================
+
+def best_result_from_df(df, method_name):
+    best = df.sort_values("repaired_cost").iloc[0]
+
+    return {
+        "method": method_name,
+        "assignment": best["repaired_assignment"],
+        "cost": best["repaired_cost"],
+        "utility": best["repaired_utility"],
+        "conflicts": best["repaired_conflicts"],
+        "loads": best["repaired_loads"],
+        "top_bitstring": best["bitstring"],
+        "probability": best["probability"],
+        "onehot_violations": best["onehot_violations"],
+    }
+
+
+final_rows = []
+
+final_rows.append({
+    "method": "Random baseline",
+    "assignment": random_best["assignment"],
+    "cost": random_best["cost"],
+    "utility": random_best["utility"],
+    "conflicts": random_best["conflicts"],
+    "loads": random_best["loads"],
+    "top_bitstring": None,
+    "probability": None,
+    "onehot_violations": 0,
+})
+
+final_rows.append({
+    "method": "Greedy baseline",
+    "assignment": greedy_best["assignment"],
+    "cost": greedy_best["cost"],
+    "utility": greedy_best["utility"],
+    "conflicts": greedy_best["conflicts"],
+    "loads": greedy_best["loads"],
+    "top_bitstring": None,
+    "probability": None,
+    "onehot_violations": 0,
+})
+
+final_rows.append({
+    "method": "Brute force exact",
+    "assignment": brute_best["assignment"],
+    "cost": brute_best["cost"],
+    "utility": brute_best["utility"],
+    "conflicts": brute_best["conflicts"],
+    "loads": brute_best["loads"],
+    "top_bitstring": None,
+    "probability": None,
+    "onehot_violations": 0,
+})
+
+if "aer_df" in globals():
+    final_rows.append(
+        best_result_from_df(aer_df, "QAOA Aer simulator")
+    )
+
+if "noise_df" in globals():
+    final_rows.append(
+        best_result_from_df(noise_df, f"QAOA noisy simulator {ibmq_comp.name}")
+    )
+
+final_rows.append(
+    best_result_from_df(hardware_df, f"QAOA REAL IBM QPU {ibmq_comp.name}")
+)
+
+final_summary_df = pd.DataFrame(final_rows)
+
+final_summary_df.to_csv(
+    OUTDIR / "FINAL_QSliceNet_benchmark_with_REAL_QPU.csv",
+    index=False
+)
+
+display(final_summary_df)
+
+# ============================================================
+# REAL IBM QPU PROBABILITY DISTRIBUTION
+# ============================================================
+
+def plot_probability_distribution_from_df(df, title, filename):
+    top = df.sort_values("probability", ascending=False).head(15)
+
+    plt.figure(figsize=(11, 5))
+
+    plt.bar(
+        range(len(top)),
+        top["probability"],
+        edgecolor="black"
+    )
+
+    plt.xticks(
+        range(len(top)),
+        top["bitstring"],
+        rotation=75,
+        ha="right",
+        fontsize=8
+    )
+
+    plt.ylabel("Probability")
+    plt.title(title)
+    plt.tight_layout()
+
+    plt.savefig(
+        OUTDIR / filename,
+        dpi=300
+    )
+
+    plt.show()
+
+
+plot_probability_distribution_from_df(
+    hardware_df,
+    f"Q-SliceNet Real IBM QPU Results on {ibmq_comp.name}",
+    f"REAL_QPU_{ibmq_comp.name}_probabilities.png"
+)
+
+# ============================================================
+# FINAL BENCHMARK PLOT WITH REAL IBM QPU
+# ============================================================
+
+plt.figure(figsize=(12, 5))
+
+plt.bar(
+    final_summary_df["method"],
+    final_summary_df["cost"],
+    edgecolor="black"
+)
+
+plt.xticks(rotation=40, ha="right")
+plt.ylabel("QUBO Cost")
+plt.title("Q-SliceNet Final Benchmark: Classical vs Simulator vs Real IBM QPU")
+plt.tight_layout()
+
+plt.savefig(
+    OUTDIR / "FINAL_benchmark_with_REAL_IBM_QPU.png",
+    dpi=300
+)
+
+plt.show()
+
+
+
